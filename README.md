@@ -1,5 +1,9 @@
 # Codex Usage Monitor
 
+<p align="center">
+  <img src="assets/codex-usage-monitor-hero.png" alt="Codex Usage Monitor — Windows usage monitor for Codex 5-hour and 7-day limits" width="100%">
+</p>
+
 > **Codex Usage Monitor is an unofficial community project and is not
 > affiliated with or endorsed by OpenAI.**
 
