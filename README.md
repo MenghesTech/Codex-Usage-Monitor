@@ -7,6 +7,8 @@
 > **Codex Usage Monitor is an unofficial community project and is not
 > affiliated with or endorsed by OpenAI.**
 
+**A lightweight Windows Codex usage widget that uses Codex's local app-server — no `auth.json` access, no copied tokens, no telemetry.**
+
 Codex Usage Monitor es un widget local para Windows que muestra el porcentaje
 usado de Codex en las ventanas de 5 horas y 7 días. Se comunica en modo lectura
 con el `codex app-server` que ya exista en el equipo.
