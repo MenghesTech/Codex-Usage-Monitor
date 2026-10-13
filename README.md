@@ -19,6 +19,8 @@ con el `codex app-server` que ya exista en el equipo.
 - Modos completo y compacto.
 - Opción `Siempre visible` (TOPMOST).
 - Bandeja del sistema, anclaje a pantalla e instancia única.
+- Alertas locales configurables con hasta tres porcentajes del 1 al 100 por
+  ventana. Comienzan desactivadas.
 - Inicio opcional con Windows mediante HKCU, sin privilegios de administrador.
 - Detección periódica de Codex: el monitor puede recuperarse si Codex se
   instala mientras permanece abierto.
@@ -56,10 +58,64 @@ Las preferencias se guardan en:
 %LOCALAPPDATA%\Codex Usage Monitor\settings.json
 ```
 
-Se conservan posición, anclaje, modo compacto y TOPMOST. Si la ruta nueva aún
+Se conservan posición, anclaje, modo compacto, TOPMOST y alertas. Si la ruta nueva aún
 no existe, se migran los campos conocidos desde
 `%USERPROFILE%\.codex-usage-monitor-qt-v062.json`; el archivo histórico no se
 elimina automáticamente.
+
+### Alertas de uso
+
+Abre `Configurar alertas…` desde el menú de bandeja o el menú contextual del
+widget. La ventana permite activar o desactivar todos los avisos y escribir
+hasta tres porcentajes enteros del 1 al 100 para cada límite (5 horas y 7 días).
+Puedes dejar campos vacíos para tener menos avisos. No se admiten porcentajes
+repetidos dentro de una ventana; al guardar, se ordenan automáticamente.
+Desactivar las alertas conserva los porcentajes para una activación posterior.
+Las instalaciones nuevas comienzan con las alertas desactivadas y los campos
+vacíos. Las preferencias existentes con umbrales fijos 80 %, 90 % y 95 % se
+migran a los campos correspondientes; los umbrales previamente activados y el
+estado de deduplicación del ciclo se conservan.
+
+El aviso se envía al cruzar un umbral desde una lectura inferior. Si activas
+una alerta con el uso ya por encima, no aparece un aviso retroactivo. Los
+umbrales cruzados en una misma lectura se agrupan en una notificación. El
+estado de avisos emitidos se conserva en `settings.json` para evitar repeticiones
+al reiniciar la aplicación durante el mismo ciclo. Un nuevo ciclo de reset
+permite nuevos avisos. Las lecturas incompletas no generan alertas; el
+comportamiento visual de la notificación depende de la configuración de Windows.
+
+Para distinguir un reset real de una corrección de `resetsAt`, el monitor exige
+que el deadline avance al menos la mitad de la duración de la ventana y que el
+consumo disminuya. Si el servicio no ofrece esas señales, no puede identificarse
+el ciclo con certeza y el monitor conserva la deduplicación del ciclo anterior.
+
+Los avisos pendientes se guardan antes de enviarse a la bandeja. Un fallo
+temporal de escritura o de `showMessage()` se reintenta con las siguientes
+lecturas; desactivar un umbral cancela sus avisos pendientes. `showMessage()`
+solo confirma que Qt aceptó la llamada, no que Windows mostrase el aviso. Si
+la aplicación se cierra mientras el disco sigue inaccesible, un aviso aún no
+guardado puede perderse. Si se cierra después de enviarlo pero antes de guardar
+su confirmación, puede repetirse al reiniciar. Por ello no se garantiza una
+entrega exactamente una vez.
+
+Para comprobar visualmente las notificaciones de Windows sin consultar Codex ni
+modificar tus ajustes reales, ejecuta desde la raíz del repositorio:
+
+```powershell
+.\.venv\Scripts\python.exe tests\manual_windows_notifications.py
+```
+
+El arnés usa un `settings.json` temporal y muestra su ruta. En el widget o la
+bandeja, abre `Configurar alertas…`, activa las alertas, introduce `80`, `90` y
+`95` para ambas ventanas y pulsa `Guardar`. En el panel de pruebas, pulsa
+`79 % / 79 %` y después `96 % / 96 %`: debe aparecer un único aviso con los
+seis cruces. `Repetir lectura` y `Reiniciar widget` no deben repetirlo. Usa
+`Nuevo ciclo: 5 % / 5 %` y vuelve a cruzar un umbral para comprobar el rearme.
+Prueba también `Cancelar`, campos vacíos, porcentajes duplicados, desactivar el
+control general y `Ocultar / mostrar widget`; las notificaciones deben seguir
+llegando a la bandeja con el widget oculto. El arnés elimina su configuración
+temporal al cerrarse. Windows puede ocultar los avisos según sus ajustes de
+notificaciones.
 
 `Abrir al iniciar Windows` utiliza exclusivamente el valor por usuario
 `CodexUsageMonitor` de `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.

@@ -160,6 +160,7 @@ def test_context_menu_reloads_real_state_each_time():
         toggle_compact=noop,
         toggle_topmost=noop,
         toggle_autostart=noop,
+        open_alert_settings=noop,
         refresh=noop,
         close_app=noop,
         autostart_enabled=lambda: next(states),

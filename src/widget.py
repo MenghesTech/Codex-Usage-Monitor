@@ -3,9 +3,10 @@ from __future__ import annotations
 import sys
 import logging
 import threading
+import weakref
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QRectF, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, QPoint, QRectF, Signal, QObject, Slot
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QFont, QGuiApplication, QIcon, QPixmap, QAction
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QHBoxLayout, QVBoxLayout, QFrame,
@@ -16,6 +17,8 @@ from .codex_client import CodexClient
 from .codex_locator import CodexNotFoundError
 from .app_paths import user_config_path
 from .settings import load_settings, save_settings
+from .alert_settings_dialog import AlertSettingsDialog
+from .usage_alerts import WINDOWS, UsageAlertEngine
 from .usage_model import ResetDeadlines, seconds_until
 from .window_geometry import anchor_position, recover_position
 
@@ -147,7 +150,13 @@ class MenuPanel(RoundedPanel):
     def __init__(self, owner, position_menu=False):
         super().__init__(radius=11, color=QColor(20, 29, 42, 238),
                          border=QColor(76, 94, 118, 205))
-        self.owner = owner
+        # Monitor also keeps its popup in self.menu. Keep this edge weak so
+        # Python does not collect a cycle of Qt wrappers after C++ deletion.
+        try:
+            self.owner = weakref.proxy(owner)
+        except TypeError:
+            # Lightweight menu doubles in tests need not support weak refs.
+            self.owner = owner
         self.position_menu = position_menu
         self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -165,8 +174,8 @@ class MenuPanel(RoundedPanel):
                 ("◁   Centro izquierda", "cl"),
                 ("▷   Centro derecha", "cr"),
             ]:
-                self.item(label, lambda a=anchor: self.choose_anchor(a),
-                          checked=owner.anchor == anchor)
+                self.item(label, self.choose_anchor,
+                          checked=owner.anchor == anchor, argument=anchor)
         else:
             self.item("◉   Mostrar / ocultar", owner.hide)
             self.item("▣   Modo compacto", owner.toggle_compact, checked=owner.compact)
@@ -177,12 +186,13 @@ class MenuPanel(RoundedPanel):
                 checked=owner.autostart_enabled(),
             )
             self.item("⌖   Anclar a                                      ›", self.open_anchor)
+            self.item("◉   Configurar alertas…", owner.open_alert_settings)
             self.sep()
             self.item("↻   Actualizar ahora", owner.refresh)
             self.sep()
             self.item("×   Salir de Codex Usage Monitor", owner.close_app, danger=True)
 
-    def item(self, text, fn, checked=False, danger=False):
+    def item(self, text, fn, checked=False, danger=False, argument=None):
         lab = ClickableLabel(text + ("   ✓" if checked else ""))
         lab.setFixedHeight(29)
         lab.setCursor(Qt.PointingHandCursor)
@@ -194,7 +204,30 @@ class MenuPanel(RoundedPanel):
             }}
             QLabel:hover {{ background: rgba(65,82,105,185); }}
         """)
-        lab.clicked.connect(lambda fn=fn: (self.close(), fn()))
+        # ClickableLabel is owned by this panel. Its signal callback must not
+        # retain the panel or its owner through a Python closure.
+        panel_ref = weakref.ref(self)
+        receiver = getattr(fn, "__self__", None)
+        if receiver is not None:
+            receiver_ref = weakref.ref(receiver)
+            method_name = fn.__name__
+
+            def invoke():
+                target = receiver_ref()
+                if target is not None:
+                    method = getattr(target, method_name)
+                    method() if argument is None else method(argument)
+        else:
+            def invoke():
+                fn() if argument is None else fn(argument)
+
+        def activate():
+            panel = panel_ref()
+            if panel is not None:
+                panel.close()
+            invoke()
+
+        lab.clicked.connect(activate)
         self.layout.addWidget(lab)
 
     def sep(self):
@@ -250,6 +283,10 @@ class Monitor(RoundedPanel):
 
         self.cfg_path = user_config_path()
         self.cfg = self.load_cfg()
+        self.alerts = UsageAlertEngine(self.cfg.get("usage_alerts"))
+        # Qt's showMessage has no delivery acknowledgement. Keep successful
+        # submissions in memory until their removal from the outbox is saved.
+        self._alerts_sent_uncommitted = set()
         self.compact = bool(self.cfg.get("compact", False))
         self.topmost = bool(self.cfg.get("topmost", True))
         self.anchor = self.cfg.get("anchor", "free")
@@ -265,6 +302,7 @@ class Monitor(RoundedPanel):
         self._tracked_screens = []
         self.drag_offset = None
         self.menu = None
+        self.alert_settings_dialog = None
 
         # Use a normal top-level window. Qt.Tool has special z-order behaviour
         # on Windows and can remain above normal application windows even after
@@ -309,6 +347,8 @@ class Monitor(RoundedPanel):
         self.tray = QSystemTrayIcon(self.make_tray_icon(), self)
         self.tray.setToolTip("Codex Usage Monitor")
         menu = QMenu()
+        # QSystemTrayIcon does not take ownership of its context menu.
+        self.tray_menu = menu
         show_action = QAction("Mostrar / ocultar", menu)
         show_action.triggered.connect(self.toggle_visibility)
         compact_action = QAction("Modo compacto", menu)
@@ -319,6 +359,7 @@ class Monitor(RoundedPanel):
         exit_action.triggered.connect(self.close_app)
         menu.addAction(show_action)
         menu.addAction(compact_action)
+        self.add_alert_action(menu)
         menu.addSeparator()
         menu.addAction(update_action)
         menu.addSeparator()
@@ -326,6 +367,77 @@ class Monitor(RoundedPanel):
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.tray_activated)
         self.tray.show()
+
+    def add_alert_action(self, menu):
+        self.alert_action = menu.addAction("Configurar alertas…")
+        self.alert_action.triggered.connect(self.open_alert_settings)
+
+    @Slot()
+    def open_alert_settings(self):
+        if self.alert_settings_dialog is not None:
+            if self.alert_settings_dialog.isVisible():
+                self.alert_settings_dialog.raise_()
+                self.alert_settings_dialog.activateWindow()
+                return self.alert_settings_dialog
+            self.alert_settings_dialog.deleteLater()
+        dialog = AlertSettingsDialog(self.alerts.to_settings(), self)
+        dialog.submitted.connect(self._save_alert_settings)
+        self.alert_settings_dialog = dialog
+        dialog.open()
+        return dialog
+
+    @Slot(bool, object)
+    def _save_alert_settings(self, active, thresholds):
+        candidate = self.alerts.clone()
+        candidate.configure(active, thresholds)
+        previous = self.cfg.get("usage_alerts")
+        self.cfg["usage_alerts"] = candidate.to_settings()
+        if not self.save_cfg():
+            if previous is None:
+                self.cfg.pop("usage_alerts", None)
+            else:
+                self.cfg["usage_alerts"] = previous
+            self.alert_settings_dialog.show_error("No se pudo guardar la configuración.")
+            return
+        self.alerts = candidate
+        queued = {self._alert_key(alert) for alert in self.alerts.queued_alerts()}
+        self._alerts_sent_uncommitted.intersection_update(queued)
+        self.alert_settings_dialog.accept()
+
+    def set_alert_enabled(self, window, threshold, enabled):
+        self.alerts.set_enabled(window, threshold, enabled)
+        if not enabled:
+            self._alerts_sent_uncommitted = {
+                key for key in self._alerts_sent_uncommitted
+                if key[:2] != (window, threshold)
+            }
+        self.cfg["usage_alerts"] = self.alerts.to_settings()
+        self.save_cfg()
+
+    @staticmethod
+    def _alert_key(alert):
+        return alert.window, alert.threshold, alert.cycle
+
+    def _acknowledge_alerts(self):
+        if not self._alerts_sent_uncommitted:
+            return
+        delivered = [alert for alert in self.alerts.queued_alerts()
+                     if self._alert_key(alert) in self._alerts_sent_uncommitted]
+        if not delivered:
+            self._alerts_sent_uncommitted.clear()
+            return
+        keys = {self._alert_key(alert) for alert in delivered}
+        proposed = self.alerts.to_settings()
+        proposed["queued"] = [item for item in proposed["queued"]
+                              if (item["window"], item["threshold"], item["cycle"])
+                              not in keys]
+        previous = self.cfg["usage_alerts"]
+        self.cfg["usage_alerts"] = proposed
+        if self.save_cfg():
+            self.alerts.acknowledge(delivered)
+            self._alerts_sent_uncommitted.difference_update(keys)
+        else:
+            self.cfg["usage_alerts"] = previous
 
     def tray_activated(self, reason):
         if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
@@ -353,8 +465,10 @@ class Monitor(RoundedPanel):
         )
         try:
             save_settings(self.cfg, self.cfg_path)
+            return True
         except (OSError, ValueError):
             logger.warning("Could not save settings", exc_info=True)
+            return False
 
     def clear_layout(self):
         old = self.layout()
@@ -538,7 +652,32 @@ class Monitor(RoundedPanel):
         self.refreshing = False
         self.deadlines.replace(u)
         self.usage = u
-        self.save_cfg()
+        self.alerts.process(u)
+        self.cfg["usage_alerts"] = self.alerts.to_settings()
+        saved = self.save_cfg()
+        if saved:
+            self._acknowledge_alerts()
+        queued = [alert for alert in self.alerts.queued_alerts()
+                  if self._alert_key(alert) not in self._alerts_sent_uncommitted]
+        if queued and saved and hasattr(self, "tray"):
+            lines = []
+            for window, (_, label) in WINDOWS.items():
+                matches = [alert for alert in queued if alert.window == window]
+                if matches:
+                    levels = ", ".join(f"{alert.threshold} %" for alert in matches)
+                    lines.append(f"{label}: {levels} ({matches[0].used} % usado)")
+            try:
+                self.tray.showMessage(
+                    "Codex Usage Monitor: alerta de uso",
+                    "\n".join(lines),
+                    QSystemTrayIcon.Information,
+                    5000,
+                )
+            except Exception:
+                logger.warning("Could not submit usage alert to the tray", exc_info=True)
+            else:
+                self._alerts_sent_uncommitted.update(map(self._alert_key, queued))
+                self._acknowledge_alerts()
         state = GREEN if u.allowed is True else RED if u.allowed is False else MUTED
         self.dot.setStyleSheet(f"color:{state};background:transparent;")
         self.plan.setText((u.plan or "—").title())

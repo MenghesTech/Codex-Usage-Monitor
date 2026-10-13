@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .app_paths import legacy_user_config_path, user_config_path
+from .usage_alerts import normalize_alert_settings
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ def validate_settings(value: Any) -> dict[str, Any]:
         candidate = value.get(name)
         if isinstance(candidate, int) and not isinstance(candidate, bool):
             result[name] = candidate
+    if "usage_alerts" in value:
+        result["usage_alerts"] = normalize_alert_settings(value["usage_alerts"])
     return result
 
 
